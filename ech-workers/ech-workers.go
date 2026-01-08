@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -26,9 +25,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/registry"
-	"golang.zx2c4.com/wintun"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -55,34 +51,15 @@ var (
 	numConns   int
 	protoMode  string // 传输协议模式: ws 或 grpc
 	useYamux   bool   // 是否启用 Yamux 多路复用（仅 WebSocket 模式）
-	controlAddr string
 	logFilePath string
 
 	echListMu sync.RWMutex
 	echList   []byte
 
-	// TUN 模式参数
-	tunMode    bool
-	tunIP      string
-	tunGateway string
-	tunMask    string
-	tunDNS     string
-	tunMTU     int
-
-	// TUN 设备和网络栈
-	tunAdapter   *wintun.Adapter
-	tunSession   wintun.Session
-	tunStack     *stack.Stack
-	tunEndpoint  *channel.Endpoint
-	tunConnCount int64
-
 	// 流量统计
 	totalUpload   int64
 	totalDownload int64
 	activeConns   int64
-
-	// 系统代理模式
-	sysProxyMode bool
 )
 
 func init() {
@@ -96,15 +73,7 @@ func init() {
 	flag.IntVar(&numConns, "n", 1, "并发连接数 (默认 1)")
 	flag.StringVar(&protoMode, "mode", "ws", "传输协议模式: ws (WebSocket) 或 grpc")
 	flag.BoolVar(&useYamux, "yamux", true, "启用 Yamux 多路复用（仅 WebSocket 模式，默认启用；关闭后兼容 Cloudflare Workers）")
-	flag.StringVar(&controlAddr, "control", "", "本地控制接口监听地址（仅用于 GUI 控制退出），例如 127.0.0.1:0")
-	flag.StringVar(&logFilePath, "logfile", "", "将日志追加写入到文件（用于 GUI 提权启动时仍能显示日志）")
-	flag.BoolVar(&tunMode, "tun", false, "启用 TUN 模式 (全局代理)")
-	flag.StringVar(&tunIP, "tun-ip", "10.0.85.2", "TUN 设备 IP 地址")
-	flag.StringVar(&tunGateway, "tun-gateway", "10.0.85.1", "TUN 网关地址")
-	flag.StringVar(&tunMask, "tun-mask", "255.255.255.0", "TUN 子网掩码")
-	flag.StringVar(&tunDNS, "tun-dns", "1.1.1.1", "TUN DNS 服务器")
-	flag.IntVar(&tunMTU, "tun-mtu", 1380, "TUN MTU（建议约 1380，用于减少隧道封装导致的分片）")
-	flag.BoolVar(&sysProxyMode, "sysproxy", false, "自动设置系统代理")
+	flag.StringVar(&logFilePath, "logfile", "", "将日志追加写入到文件")
 }
 
 func main() {
@@ -115,8 +84,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("[日志] 打开日志文件失败: %v", err)
 		}
-		// 注意：这里不 defer f.Close()，因为日志需要持续写入直到进程退出
-		// 进程退出时操作系统会自动关闭文件句柄
 		log.SetOutput(io.MultiWriter(os.Stdout, f))
 	}
 
@@ -136,12 +103,6 @@ func main() {
 	// 清理函数
 	cleanup := func() {
 		log.Printf("[清理] 正在清理资源...")
-		if sysProxyMode {
-			disableSystemProxy()
-		}
-		if tunMode && tunAdapter != nil {
-			cleanupTUN()
-		}
 		log.Printf("[清理] 资源清理完成")
 	}
 
@@ -156,17 +117,6 @@ func main() {
 		log.Printf("[信号] 收到退出信号")
 		quit()
 	}()
-
-	if controlAddr != "" {
-		actualAddr, err := startControlServer(controlAddr, func() {
-			log.Printf("[控制] 收到退出请求")
-			quit()
-		})
-		if err != nil {
-			log.Fatalf("[控制] 启动失败: %v", err)
-		}
-		log.Printf("CONTROL_ADDR=%s", actualAddr)
-	}
 
 	// 根据协议模式初始化
 	useECH := !fallback
@@ -188,76 +138,8 @@ func main() {
 	InitTransport(protoMode, serverAddr, serverIP, token, useECH, useYamux)
 	log.Printf("[启动] 传输层: %s", GetTransport().Name())
 
-	if tunMode {
-		log.Printf("[启动] 正在初始化 TUN 设备...")
-		if !isAdmin() {
-			log.Fatal("[错误] TUN 模式需要管理员权限，请以管理员身份运行")
-		}
-
-		// TUN 模式下忽略系统代理设置（TUN 已经捕获全部流量）
-		if sysProxyMode {
-			log.Printf("[提示] TUN 模式已启用，系统代理设置将被忽略（TUN 已捕获全部流量）")
-		}
-
-		if err := startTUNMode(); err != nil {
-			log.Fatalf("[启动] TUN 模式初始化失败: %v", err)
-		}
-	} else {
-		// 非 TUN 模式：启动本地代理服务器
-		// 如果启用系统代理模式，自动配置
-		if sysProxyMode {
-			if err := enableSystemProxy(listenAddr); err != nil {
-				log.Printf("[警告] 设置系统代理失败: %v", err)
-			} else {
-				log.Printf("[系统代理] 已启用，代理地址: %s", listenAddr)
-			}
-		}
-		runProxyServer(listenAddr)
-	}
-}
-
-func startControlServer(addr string, quit func()) (string, error) {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "", err
-	}
-	if host == "" {
-		return "", fmt.Errorf("control 只能监听 127.0.0.1 或 localhost")
-	}
-	if host != "127.0.0.1" && host != "localhost" {
-		return "", fmt.Errorf("control 只能监听 127.0.0.1 或 localhost")
-	}
-
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return "", err
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/quit", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			quit()
-		}()
-	})
-
-	server := &http.Server{Handler: mux}
-	go func() {
-		_ = server.Serve(ln)
-	}()
-
-	return ln.Addr().String(), nil
+	// 启动本地代理服务器
+	runProxyServer(listenAddr)
 }
 
 // ======================== 工具函数 ========================
@@ -839,13 +721,12 @@ func handleUDPRelay(udpConn *net.UDPConn, clientAddr string, stopChan chan struc
 			go handleDNSQuery(udpConn, addr, udpData, data[:headerLen])
 		} else {
 			log.Printf("[UDP] %s -> %s (暂不支持非 DNS UDP)", clientAddr, target)
-			// 这里可以扩展支持其他 UDP 流量
 		}
 	}
 }
 
 func handleDNSQuery(udpConn *net.UDPConn, clientAddr *net.UDPAddr, dnsQuery []byte, socks5Header []byte) {
-	// 通过 DoH 查询（使用重命名后的函数）
+	// 通过 DoH 查询
 	dnsResponse, err := queryDoHForProxy(dnsQuery)
 	if err != nil {
 		log.Printf("[UDP-DNS] DoH 查询失败: %v", err)
@@ -1118,520 +999,4 @@ func sendSuccessResponse(conn net.Conn, mode int) error {
 		return nil
 	}
 	return nil
-}
-
-// ======================== 系统代理设置 ========================
-
-const (
-	internetSettingsKey = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-)
-
-// enableSystemProxy 启用 Windows 系统代理
-func enableSystemProxy(proxyAddr string) error {
-	key, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsKey, registry.SET_VALUE)
-	if err != nil {
-		return fmt.Errorf("打开注册表失败: %w", err)
-	}
-	defer key.Close()
-
-	// 启用代理
-	if err := key.SetDWordValue("ProxyEnable", 1); err != nil {
-		return fmt.Errorf("设置 ProxyEnable 失败: %w", err)
-	}
-
-	// 设置代理服务器地址
-	if err := key.SetStringValue("ProxyServer", proxyAddr); err != nil {
-		return fmt.Errorf("设置 ProxyServer 失败: %w", err)
-	}
-
-	// 设置不使用代理的地址（本地地址）
-	bypass := "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>"
-	if err := key.SetStringValue("ProxyOverride", bypass); err != nil {
-		return fmt.Errorf("设置 ProxyOverride 失败: %w", err)
-	}
-
-	// 通知系统代理设置已更改
-	notifyProxyChange()
-
-	return nil
-}
-
-// disableSystemProxy 禁用 Windows 系统代理
-func disableSystemProxy() {
-	key, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsKey, registry.SET_VALUE)
-	if err != nil {
-		log.Printf("[系统代理] 关闭时打开注册表失败: %v", err)
-		return
-	}
-	defer key.Close()
-
-	// 禁用代理
-	if err := key.SetDWordValue("ProxyEnable", 0); err != nil {
-		log.Printf("[系统代理] 禁用失败: %v", err)
-		return
-	}
-
-	// 通知系统代理设置已更改
-	notifyProxyChange()
-
-	log.Printf("[系统代理] 已禁用")
-}
-
-// notifyProxyChange 通知系统代理设置已更改
-func notifyProxyChange() {
-	// 调用 InternetSetOption 通知系统刷新代理设置
-	// 这需要调用 wininet.dll
-	wininet := windows.NewLazySystemDLL("wininet.dll")
-	internetSetOption := wininet.NewProc("InternetSetOptionW")
-
-	const (
-		INTERNET_OPTION_SETTINGS_CHANGED = 39
-		INTERNET_OPTION_REFRESH          = 37
-	)
-
-	internetSetOption.Call(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
-	internetSetOption.Call(0, INTERNET_OPTION_REFRESH, 0, 0)
-}
-
-// ======================== TUN 模式实现 ========================
-
-// cleanupTUN 清理 TUN 资源
-func cleanupTUN() {
-	log.Printf("[TUN] 正在清理 TUN 资源...")
-
-	// 删除添加的路由
-	cmd := exec.Command("route", "delete", "0.0.0.0", "mask", "0.0.0.0", tunGateway)
-	cmd.Run()
-
-	// 关闭会话
-	if tunSession != (wintun.Session{}) {
-		tunSession.End()
-		log.Printf("[TUN] 会话已关闭")
-	}
-
-	// 关闭适配器
-	if tunAdapter != nil {
-		tunAdapter.Close()
-		tunAdapter = nil
-		log.Printf("[TUN] 适配器已关闭")
-	}
-
-	log.Printf("[TUN] TUN 资源清理完成")
-}
-
-func isAdmin() bool {
-	var sid *windows.SID
-	err := windows.AllocateAndInitializeSid(
-		&windows.SECURITY_NT_AUTHORITY,
-		2,
-		windows.SECURITY_BUILTIN_DOMAIN_RID,
-		windows.DOMAIN_ALIAS_RID_ADMINS,
-		0, 0, 0, 0, 0, 0,
-		&sid)
-	if err != nil {
-		return false
-	}
-	defer windows.FreeSid(sid)
-
-	token := windows.Token(0)
-	member, err := token.IsMember(sid)
-	if err != nil {
-		return false
-	}
-	return member
-}
-
-func startTUNMode() error {
-	var err error
-
-	tunAdapter, err = wintun.CreateAdapter("ECH-TUN", "WireGuard", nil)
-	if err != nil {
-		return fmt.Errorf("创建 TUN 适配器失败: %w", err)
-	}
-	log.Printf("[TUN] 适配器已创建")
-
-	tunSession, err = tunAdapter.StartSession(0x800000)
-	if err != nil {
-		return fmt.Errorf("启动会话失败: %w", err)
-	}
-	log.Printf("[TUN] 会话已启动")
-
-	if err := configureTUNInterface(); err != nil {
-		return fmt.Errorf("配置网络接口失败: %w", err)
-	}
-
-	if err := initNetworkStack(); err != nil {
-		return fmt.Errorf("初始化网络栈失败: %w", err)
-	}
-
-	if err := configureRouting(); err != nil {
-		return fmt.Errorf("配置路由失败: %w", err)
-	}
-
-	go tunReadLoop()
-	go tunWriteLoop()
-
-	log.Printf("[TUN] TUN 模式已启动，IP: %s", tunIP)
-
-	select {}
-}
-
-func configureTUNInterface() error {
-	// 使用接口名称 "ECH-TUN" 而不是 LUID
-	interfaceName := "ECH-TUN"
-
-	cmd := exec.Command("netsh", "interface", "ip", "set", "address",
-		fmt.Sprintf("name=%s", interfaceName),
-		"source=static",
-		fmt.Sprintf("addr=%s", tunIP),
-		fmt.Sprintf("mask=%s", tunMask),
-		fmt.Sprintf("gateway=%s", tunGateway))
-
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[TUN] netsh 配置失败: %s (需要管理员权限)", output)
-		return fmt.Errorf("配置网络接口失败，请确保以管理员身份运行: %w", err)
-	}
-
-	log.Printf("[TUN] 接口配置: IP=%s, Gateway=%s, Mask=%s", tunIP, tunGateway, tunMask)
-
-	cmd = exec.Command("netsh", "interface", "ip", "set", "dns",
-		fmt.Sprintf("name=%s", interfaceName),
-		"source=static",
-		fmt.Sprintf("addr=%s", tunDNS))
-	cmd.Run()
-
-	log.Printf("[TUN] DNS 设置: %s", tunDNS)
-
-	// 尝试设置接口 MTU（失败不致命）
-	if tunMTU > 0 {
-		cmd = exec.Command("netsh", "interface", "ipv4", "set", "subinterface",
-			interfaceName,
-			fmt.Sprintf("mtu=%d", tunMTU),
-			"store=persistent")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("[TUN] 设置 IPv4 MTU 失败: %v (%s)", err, output)
-		} else {
-			log.Printf("[TUN] MTU 已设置: %d", tunMTU)
-		}
-		cmd = exec.Command("netsh", "interface", "ipv6", "set", "subinterface",
-			interfaceName,
-			fmt.Sprintf("mtu=%d", tunMTU),
-			"store=persistent")
-		_, _ = cmd.CombinedOutput()
-	}
-
-	return nil
-}
-
-func initNetworkStack() error {
-	mtu := tunMTU
-	if mtu <= 0 {
-		mtu = 1500
-	}
-	tunEndpoint = channel.New(512, uint32(mtu), "")
-
-	tunStack = stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{
-			ipv4.NewProtocol,
-			ipv6.NewProtocol,
-		},
-		TransportProtocols: []stack.TransportProtocolFactory{
-			tcp.NewProtocol,
-			udp.NewProtocol,
-		},
-	})
-
-	if err := tunStack.CreateNIC(1, tunEndpoint); err != nil {
-		return fmt.Errorf("创建 NIC 失败: %v", err)
-	}
-
-	gatewayIP := parseIPv4(tunGateway)
-	tunStack.AddProtocolAddress(1, tcpip.ProtocolAddress{
-		Protocol: ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   tcpip.AddrFrom4([4]byte{gatewayIP[0], gatewayIP[1], gatewayIP[2], gatewayIP[3]}),
-			PrefixLen: 24,
-		},
-	}, stack.AddressProperties{})
-
-	subnet, _ := tcpip.NewSubnet(tcpip.AddrFrom4([4]byte{0, 0, 0, 0}), tcpip.MaskFromBytes([]byte{0, 0, 0, 0}))
-	tunStack.SetRouteTable([]tcpip.Route{
-		{
-			Destination: subnet,
-			NIC:         1,
-		},
-	})
-
-	tunStack.SetPromiscuousMode(1, true)
-	tunStack.SetSpoofing(1, true)
-
-	go handleTCPConnections()
-	go handleUDPPackets()
-
-	log.Printf("[TUN] 网络栈已初始化")
-	return nil
-}
-
-func configureRouting() error {
-	// 获取接口索引用于 route 命令
-	iface, err := net.InterfaceByName("ECH-TUN")
-	if err != nil {
-		log.Printf("[TUN] 获取接口索引失败: %v，尝试使用网关直接添加路由", err)
-		// 备用方案：不指定接口，让系统自动选择
-		cmd := exec.Command("route", "add", "0.0.0.0", "mask", "0.0.0.0", tunGateway, "metric", "1")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("[TUN] 路由设置警告: %s (可能已存在)", output)
-		}
-	} else {
-		cmd := exec.Command("route", "add", "0.0.0.0", "mask", "0.0.0.0", tunGateway,
-			"metric", "1", "if", strconv.Itoa(iface.Index))
-		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("[TUN] 路由设置警告: %s (可能已存在)", output)
-		}
-	}
-
-	log.Printf("[TUN] 路由表已配置 (全局代理)")
-	return nil
-}
-
-func tunReadLoop() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[TUN] 读取协程崩溃: %v", r)
-		}
-	}()
-
-	mtu := tunMTU
-	if mtu <= 0 {
-		mtu = 1500
-	}
-	packetBuf := make([]byte, mtu)
-
-	for {
-		packet, err := tunSession.ReceivePacket()
-		if err != nil {
-			log.Printf("[TUN] 读取数据包失败: %v", err)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		n := copy(packetBuf, packet)
-
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(packetBuf[:n]),
-		})
-
-		tunEndpoint.InjectInbound(header.IPv4ProtocolNumber, pkt)
-		pkt.DecRef()
-	}
-}
-
-func tunWriteLoop() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[TUN] 写入协程崩溃: %v", r)
-		}
-	}()
-
-	for {
-		pkt := tunEndpoint.ReadContext(context.Background())
-		if pkt == nil {
-			continue
-		}
-
-		data := pkt.ToView().AsSlice()
-
-		packet, err := tunSession.AllocateSendPacket(len(data))
-		if err != nil {
-			pkt.DecRef()
-			log.Printf("[TUN] 分配发送缓冲区失败: %v", err)
-			continue
-		}
-
-		copy(packet, data)
-		tunSession.SendPacket(packet)
-		pkt.DecRef()
-	}
-}
-
-func handleTCPConnections() {
-	var wq waiter.Queue
-	ep, err := tunStack.NewEndpoint(tcp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
-	if err != nil {
-		log.Fatalf("[TCP] 创建端点失败: %v", err)
-	}
-
-	if err := ep.Bind(tcpip.FullAddress{
-		Port: 0,
-	}); err != nil {
-		log.Fatalf("[TCP] 绑定失败: %v", err)
-	}
-
-	if err := ep.Listen(128); err != nil {
-		log.Fatalf("[TCP] 监听失败: %v", err)
-	}
-
-	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.EventIn)
-	wq.EventRegister(&waitEntry)
-	defer wq.EventUnregister(&waitEntry)
-
-	for {
-		n, wq, err := ep.Accept(nil)
-		if err != nil {
-			if _, ok := err.(*tcpip.ErrWouldBlock); ok {
-				<-notifyCh
-				continue
-			}
-			log.Printf("[TCP] 接受连接失败: %v", err)
-			continue
-		}
-
-		go handleTCPConnection(n, wq)
-	}
-}
-
-func handleTCPConnection(ep tcpip.Endpoint, wq *waiter.Queue) {
-	defer ep.Close()
-
-	atomic.AddInt64(&tunConnCount, 1)
-	connID := atomic.LoadInt64(&tunConnCount)
-
-	remoteAddr, _ := ep.GetRemoteAddress()
-	localAddr, _ := ep.GetLocalAddress()
-
-	target := fmt.Sprintf("%s:%d", net.IP(remoteAddr.Addr.AsSlice()).String(), remoteAddr.Port)
-	log.Printf("[TCP:%d] 新连接: %s:%d -> %s", connID,
-		net.IP(localAddr.Addr.AsSlice()).String(), localAddr.Port, target)
-
-	conn := gonet.NewTCPConn(wq, ep)
-	defer conn.Close()
-
-	// 使用统一的 Transport 抽象层
-	tunnelConn, err := DialTunnel()
-	if err != nil {
-		log.Printf("[TCP:%d] 隧道连接失败: %v", connID, err)
-		return
-	}
-	defer tunnelConn.Close()
-
-	// 启动心跳
-	stopPing := tunnelConn.StartPing(10 * time.Second)
-	defer close(stopPing)
-
-	// 发送连接请求
-	if err := tunnelConn.Connect(target, nil); err != nil {
-		log.Printf("[TCP:%d] CONNECT 失败: %v", connID, err)
-		return
-	}
-
-	log.Printf("[TCP:%d] 已连接: %s", connID, target)
-
-	done := make(chan bool, 2)
-
-	// Client -> Server
-	go func() {
-		buf := make([]byte, 32768)
-		for {
-			n, err := conn.Read(buf)
-			if err != nil {
-				done <- true
-				return
-			}
-
-			if err := tunnelConn.Write(buf[:n]); err != nil {
-				done <- true
-				return
-			}
-		}
-	}()
-
-	// Server -> Client
-	go func() {
-		for {
-			data, err := tunnelConn.Read()
-			if err != nil {
-				done <- true
-				return
-			}
-
-			if _, err := conn.Write(data); err != nil {
-				done <- true
-				return
-			}
-		}
-	}()
-
-	<-done
-	log.Printf("[TCP:%d] 已断开: %s", connID, target)
-}
-
-func handleUDPPackets() {
-	var wq waiter.Queue
-	ep, err := tunStack.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
-	if err != nil {
-		log.Fatalf("[UDP] 创建端点失败: %v", err)
-	}
-
-	if err := ep.Bind(tcpip.FullAddress{}); err != nil {
-		log.Fatalf("[UDP] 绑定失败: %v", err)
-	}
-
-	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.EventIn)
-	wq.EventRegister(&waitEntry)
-	defer wq.EventUnregister(&waitEntry)
-
-	for {
-		var addr tcpip.FullAddress
-		var buf bytes.Buffer
-		res, err := ep.Read(&buf, tcpip.ReadOptions{
-			NeedRemoteAddr: true,
-		})
-		if err != nil {
-			if _, ok := err.(*tcpip.ErrWouldBlock); ok {
-				<-notifyCh
-				continue
-			}
-			continue
-		}
-		addr = res.RemoteAddr
-
-		data := buf.Bytes()
-		if len(data) > 0 {
-			target := fmt.Sprintf("%s:%d", net.IP(addr.Addr.AsSlice()).String(), addr.Port)
-
-			if addr.Port == 53 {
-				go handleTUNDNSQuery(ep, &addr, data)
-			} else {
-				log.Printf("[UDP] 收到数据包 -> %s (暂不支持非 DNS UDP)", target)
-			}
-		}
-	}
-}
-
-func handleTUNDNSQuery(ep tcpip.Endpoint, clientAddr *tcpip.FullAddress, query []byte) {
-	dnsResponse, err := queryDoHForProxy(query)
-	if err != nil {
-		log.Printf("[DNS] DoH 查询失败: %v", err)
-		return
-	}
-
-	var buf bytes.Buffer
-	buf.Write(dnsResponse)
-	_, tcpipErr := ep.Write(&buf, tcpip.WriteOptions{
-		To: clientAddr,
-	})
-	if tcpipErr != nil {
-		log.Printf("[DNS] 发送响应失败: %v", tcpipErr)
-		return
-	}
-
-	log.Printf("[DNS] 查询成功: %d 字节", len(dnsResponse))
-}
-
-func parseIPv4(s string) net.IP {
-	ip := net.ParseIP(s)
-	if ip == nil {
-		return net.IPv4(0, 0, 0, 0)
-	}
-	return ip.To4()
 }
