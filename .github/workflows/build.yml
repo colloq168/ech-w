@@ -32,7 +32,7 @@ jobs:
         run: go mod tidy
 
       - name: Build macOS amd64
-        run: GOOS=darwin GOARCH=amd64 go build -o ../artifacts/ech-workers .
+        run: GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers-core-darwin-amd64 .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
