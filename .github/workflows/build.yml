@@ -194,4 +194,4 @@ jobs:
             - 支持 SOCKS5 / HTTP 代理
             - 支持 TUN 模式（全局代理）
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
