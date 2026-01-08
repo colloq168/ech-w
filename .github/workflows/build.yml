@@ -1,67 +1,60 @@
-name: Build ECH-Workers (macOS amd64)
+name: Build ECH-Workers
 
 on:
   push:
-    branches: [ main ]
     tags:
       - 'v*'
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  build:
-    name: Build for macOS amd64
-    runs-on: macos-latest
-    defaults:
-      run:
-        working-directory: ech-workers
+  build-kernel:
+    name: Build Kernel
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+      
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.24'
-
-      - name: Prepare artifacts dir
-        run: mkdir -p ../artifacts
-
-      - name: Go mod tidy
-        run: go mod tidy
-
+      
       - name: Build macOS amd64
-        run: GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers-core-darwin-amd64 .
-
-      - name: Upload Artifact
+        run: |
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers-core-darwin-amd64 .
+      
+      - name: Build macOS arm64
+        run: |
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o ech-workers-core-darwin-arm64 .
+      
+      - name: Upload Kernel Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ech-workers-macos-amd64
-          path: artifacts/ech-workers
-
+          name: kernel-binaries
+          path: ech-workers-core-*
+  
   release:
     name: Create Release
-    needs: [build]
+    needs: [build-kernel]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Download Artifact
+      - name: Download Kernel Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ech-workers-macos-amd64
-          path: release/
-
+          name: kernel-binaries
+          path: ./release
+      
+      - name: Download GUI Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: gui-binaries
+          path: ./release
+      
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: release/ech-workers
-          body: |
-            ## 📦 下载说明
-            - **ech-workers** - macOS (amd64) 客户端可执行文件
-            ## ✨ 特性
-            - 支持 ECH (Encrypted Client Hello) 加密
-            - 支持 Yamux 多路复用协议
-            - 支持 SOCKS5 / HTTP 代理
+          files: release/*
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.TOKEN }}
