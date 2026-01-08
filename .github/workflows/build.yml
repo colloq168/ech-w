@@ -1,4 +1,4 @@
-name: Build ECH-Workers
+name: Build ECH-Workers (macOS amd64)
 
 on:
   push:
@@ -11,9 +11,9 @@ permissions:
   contents: write
 
 jobs:
-  build-client-kernel:
-    name: Build Client Kernel (ech-workers)
-    runs-on: ubuntu-latest
+  build:
+    name: Build for macOS amd64
+    runs-on: macos-latest
     defaults:
       run:
         working-directory: ech-workers
@@ -31,167 +31,37 @@ jobs:
       - name: Go mod tidy
         run: go mod tidy
 
-      # 注意：内核使用了 wintun 等 Windows 专属依赖，只能编译 Windows 版本
-      - name: Build Windows amd64
-        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ../artifacts/ech-workers-core-windows-amd64.exe .
+      - name: Build macOS amd64
+        run: GOOS=darwin GOARCH=amd64 go build -o ../artifacts/ech-workers .
 
-      - name: Build Windows arm64
-        run: GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o ../artifacts/ech-workers-core-windows-arm64.exe .
-
-      - name: Upload Client Kernel Artifacts
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ech-workers-core
-          path: artifacts/ech-workers-core-*
-
-  build-proxy-server:
-    name: Build Proxy Server (proxy-server)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: proxy-server
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-
-      - name: Prepare artifacts dir
-        run: mkdir -p ../artifacts
-
-      - name: Go mod tidy
-        run: go mod tidy
-
-      - name: Build Windows amd64
-        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ../artifacts/proxy-server-windows-amd64.exe .
-
-      - name: Build Linux amd64
-        run: GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ../artifacts/proxy-server-linux-amd64 .
-
-      - name: Upload Proxy Server Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: proxy-server
-          path: artifacts/proxy-server-*
-
-  build-gui:
-    name: Build GUI (Windows)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Publish GUI win-x64
-        shell: pwsh
-        run: |
-          cd ech-workers/gui/EchWorkersGui
-          dotnet publish -c Release -r win-x64 --self-contained true -o ..\..\..\artifacts\gui-win-x64
-
-      - name: Publish GUI win-arm64
-        shell: pwsh
-        run: |
-          cd ech-workers/gui/EchWorkersGui
-          dotnet publish -c Release -r win-arm64 --self-contained true -o ..\..\..\artifacts\gui-win-arm64
-
-      - name: Upload GUI x64 Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: gui-x64
-          path: artifacts/gui-win-x64/
-
-      - name: Upload GUI arm64 Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: gui-arm64
-          path: artifacts/gui-win-arm64/
+          name: ech-workers-macos-amd64
+          path: artifacts/ech-workers
 
   release:
     name: Create Release
-    needs: [build-client-kernel, build-proxy-server, build-gui]
+    needs: [build]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      # 先 checkout 获取 wintun.dll（必须在下载 artifacts 之前）
-      - uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            ech-workers/wintun.dll
-
-      - name: Download Client Kernel
+      - name: Download Artifact
         uses: actions/download-artifact@v4
         with:
-          name: ech-workers-core
-          path: kernel
-
-      - name: Download Proxy Server
-        uses: actions/download-artifact@v4
-        with:
-          name: proxy-server
-          path: server
-
-      - name: Download GUI x64
-        uses: actions/download-artifact@v4
-        with:
-          name: gui-x64
-          path: gui-x64
-
-      - name: Download GUI arm64
-        uses: actions/download-artifact@v4
-        with:
-          name: gui-arm64
-          path: gui-arm64
-
-      - name: Package by architecture
-        run: |
-          mkdir -p release
-
-          # Client Windows amd64 (kernel + GUI目录 + wintun.dll)
-          mkdir -p tmp/client-win-amd64
-          cp kernel/ech-workers-core-windows-amd64.exe tmp/client-win-amd64/ech-workers-core.exe
-          cp -r gui-x64/* tmp/client-win-amd64/
-          cp ech-workers/wintun.dll tmp/client-win-amd64/wintun.dll
-          cd tmp/client-win-amd64 && zip -r ../../release/ech-workers-client-windows-amd64.zip . && cd ../..
-
-          # Client Windows arm64 (kernel + GUI目录 + wintun.dll)
-          mkdir -p tmp/client-win-arm64
-          cp kernel/ech-workers-core-windows-arm64.exe tmp/client-win-arm64/ech-workers-core.exe
-          cp -r gui-arm64/* tmp/client-win-arm64/
-          cp ech-workers/wintun.dll tmp/client-win-arm64/wintun.dll
-          cd tmp/client-win-arm64 && zip -r ../../release/ech-workers-client-windows-arm64.zip . && cd ../..
-
-          # Server Windows amd64
-          mkdir -p tmp/server-win-amd64
-          cp server/proxy-server-windows-amd64.exe tmp/server-win-amd64/proxy-server.exe
-          cd tmp/server-win-amd64 && zip -r ../../release/proxy-server-windows-amd64.zip . && cd ../..
-
-          # Server Linux amd64
-          mkdir -p tmp/server-linux-amd64
-          cp server/proxy-server-linux-amd64 tmp/server-linux-amd64/proxy-server
-          cd tmp/server-linux-amd64 && zip -r ../../release/proxy-server-linux-amd64.zip . && cd ../..
-
-          ls -lh release/
+          name: ech-workers-macos-amd64
+          path: release/
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: release/*.zip
+          files: release/ech-workers
           body: |
             ## 📦 下载说明
-
-            - **ech-workers-client-*.zip** - 客户端完整包（GUI + 内核 + wintun.dll）
-            - **proxy-server-*.zip** - 代理服务端
-
+            - **ech-workers** - macOS (amd64) 客户端可执行文件
             ## ✨ 特性
-
             - 支持 ECH (Encrypted Client Hello) 加密
             - 支持 Yamux 多路复用协议
             - 支持 SOCKS5 / HTTP 代理
-            - 支持 TUN 模式（全局代理）
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
